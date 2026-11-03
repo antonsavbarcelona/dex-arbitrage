@@ -517,6 +517,48 @@ pub async fn rank(h: &crate::http::Http) -> Vec<Rank> {
     out
 }
 
+/// Every 5 minutes the funding of every shared market on every venue (GMX: its long / short costs) to
+/// data/ws/funding_<day>.csv:  ts,venue,asset,symbol,rate_h,predicted_h,next_ms,interval_h,long_cost_h,short_cost_h
+/// (rate_h a fraction / hour, + = longs pay; the intra-hour path of each rate before its payment). The registry refreshed
+/// every 6 h.
+pub async fn funding_snapshots(h: crate::http::Http, dir: std::path::PathBuf) {
+    let mut reg_at = 0i64;
+    let mut per_venue: HashMap<V, Vec<Instrument>> = HashMap::new();
+    loop {
+        let t = now_ms();
+        if t - reg_at > 6 * 3_600_000 || per_venue.is_empty() {
+            let reg = Registry::load(&h, &ALL).await;
+            per_venue.clear();
+            for i in reg.shared().values().flatten() {
+                per_venue.entry(registry::venue_of(i)).or_default().push(i.clone());
+            }
+            reg_at = t;
+        }
+        let hr = &h;
+        let got = futures::future::join_all(per_venue.iter().map(|(v, ins)| async move {
+            (*v, tokio::time::timeout(Duration::from_secs(150), v.funding_now(hr, ins)).await.ok().and_then(|r| r.ok()).unwrap_or_default(), ins)
+        }))
+        .await;
+        let day = t / 86_400_000;
+        if let Ok(mut f_) = std::fs::OpenOptions::new().create(true).append(true).open(dir.join(format!("funding_{day}.csv"))) {
+            let mut n = 0;
+            for (v, fs, ins) in got {
+                let by_sym: HashMap<&str, &Instrument> = ins.iter().map(|i| (i.symbol.as_str(), i)).collect();
+                for x in fs {
+                    if let Some(i) = by_sym.get(x.symbol.as_str()) {
+                        let o = |y: Option<f64>| y.map_or(String::new(), |z| z.to_string());
+                        let _ = writeln!(f_, "{t},{},{},{},{},{},{},{},{},{}", v.name(), i.base, x.symbol.replace(',', ";"), x.rate_h, o(x.predicted_h), x.next_ms.map_or(String::new(), |z| z.to_string()), x.interval_h, o(x.long_cost_h), o(x.short_cost_h));
+                        n += 1;
+                    }
+                }
+            }
+            println!("[{}] funding snapshot: {n} rates", t / 1000);
+        }
+        let next = (now_ms() / 300_000 + 1) * 300_000;
+        tokio::time::sleep(Duration::from_millis((next - now_ms()).max(1_000) as u64)).await;
+    }
+}
+
 /// The re-rank: right after each hour's funding payment (the user's call: the venues pay every hour), at :02.
 fn next_rerank_ms(t: i64) -> i64 {
     (t / 3_600_000 + 1) * 3_600_000 + 120_000
@@ -530,6 +572,7 @@ pub async fn run(h: &crate::http::Http, fixed: Option<Vec<String>>, top: usize, 
     let start = now_ms();
     let dir = crate::data_dir().join("ws");
     std::fs::create_dir_all(&dir)?;
+    tokio::spawn(funding_snapshots(h.clone(), dir.clone()));
     loop {
         let assets = match &fixed {
             Some(a) => a.clone(),

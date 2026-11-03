@@ -10,12 +10,14 @@
 //!   dexarb ws [--top N | --assets A,B,..] [--hours H]  the WebSocket collector (default: every underlying on 2+ venues; --top N by the funding spread)
 //!   dexarb fundrank [--top N]                     the shared assets by the cross-venue funding spread now
 //!   dexarb mt [--lq MS] [--lh MS] [--hold-min M]   the maker-taker simulator on the WebSocket data (a limit on A, the hedge at market on B)
+//!   dexarb fstab                       the funding-stability study on data/funding -> data/fstab.md
 //!   dexarb collect [--every S]         the forward collector + the paper engine (deliverables 5 level D, 6)
 
 mod averaging;
 mod basis;
 mod collect;
 mod exec;
+mod fstab;
 mod history;
 mod http;
 mod model;
@@ -72,6 +74,7 @@ async fn main() -> Result<()> {
             .await
         }
         "research" => research::run(),
+        "fstab" => fstab::run(),
         "mt" => mt::run(&h, &args[2..]).await,
         "ws" => {
             // --assets A,B,..: a fixed list; else the --top N (25) by the cross-venue funding spread, re-ranked each hour
