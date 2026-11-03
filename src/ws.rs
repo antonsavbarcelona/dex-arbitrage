@@ -156,9 +156,10 @@ fn by<'a>(subs: &'a [Sub], key: impl Fn(&Sub) -> String) -> HashMap<String, Sub>
 }
 
 /// The venues' streams.
-pub fn spawn(v: V, subs: Vec<Sub>, tx: UnboundedSender<Ev>) {
+pub fn spawn(v: V, subs: Vec<Sub>, tx: UnboundedSender<Ev>) -> Vec<tokio::task::JoinHandle<()>> {
+    let mut hs = Vec::new();
     if subs.is_empty() {
-        return;
+        return hs;
     }
     match v {
         V::Hyperliquid => {
@@ -181,7 +182,7 @@ pub fn spawn(v: V, subs: Vec<Sub>, tx: UnboundedSender<Ev>) {
                 }
                 _ => {}
             });
-            tokio::spawn(run_ws("Hyperliquid", "wss://api.hyperliquid.xyz/ws".into(), ss, Some(json!({"method": "ping"})), h, tx));
+            hs.push(tokio::spawn(run_ws("Hyperliquid", "wss://api.hyperliquid.xyz/ws".into(), ss, Some(json!({"method": "ping"})), h, tx)));
         }
         V::Lighter => {
             let m = by(&subs, |x| x.id.clone());
@@ -208,7 +209,7 @@ pub fn spawn(v: V, subs: Vec<Sub>, tx: UnboundedSender<Ev>) {
                     }
                 }
             });
-            tokio::spawn(run_ws("Lighter", "wss://mainnet.zklighter.elliot.ai/stream".into(), ss, None, h, tx));
+            hs.push(tokio::spawn(run_ws("Lighter", "wss://mainnet.zklighter.elliot.ai/stream".into(), ss, None, h, tx)));
         }
         V::Extended => {
             for x in subs {
@@ -224,8 +225,8 @@ pub fn spawn(v: V, subs: Vec<Sub>, tx: UnboundedSender<Ev>) {
                     }
                 });
                 let base = "wss://api.starknet.extended.exchange/stream.extended.exchange/v1";
-                tokio::spawn(run_ws("Extended", format!("{base}/orderbooks/{}?depth=1", x.sym), vec![], None, hb, tx.clone()));
-                tokio::spawn(run_ws("Extended", format!("{base}/publicTrades/{}", x.sym), vec![], None, ht, tx.clone()));
+                hs.push(tokio::spawn(run_ws("Extended", format!("{base}/orderbooks/{}?depth=1", x.sym), vec![], None, hb, tx.clone())));
+                hs.push(tokio::spawn(run_ws("Extended", format!("{base}/publicTrades/{}", x.sym), vec![], None, ht, tx.clone())));
             }
         }
         V::Aster => {
@@ -242,7 +243,7 @@ pub fn spawn(v: V, subs: Vec<Sub>, tx: UnboundedSender<Ev>) {
                     trade(tx, "Aster", x, num(&d["p"]), num(&d["q"]), if d["m"] == json!(true) { -1 } else { 1 }, d["T"].as_i64());
                 }
             });
-            tokio::spawn(run_ws("Aster", format!("wss://fstream.asterdex.com/stream?streams={}", streams.join("/")), vec![], None, h, tx));
+            hs.push(tokio::spawn(run_ws("Aster", format!("wss://fstream.asterdex.com/stream?streams={}", streams.join("/")), vec![], None, h, tx)));
         }
         V::Grvt => {
             let m = by(&subs, |x| x.sym.clone());
@@ -259,7 +260,7 @@ pub fn spawn(v: V, subs: Vec<Sub>, tx: UnboundedSender<Ev>) {
                     _ => {}
                 }
             });
-            tokio::spawn(run_ws("GRVT", "wss://market-data.grvt.io/ws/full".into(), ss, None, h, tx));
+            hs.push(tokio::spawn(run_ws("GRVT", "wss://market-data.grvt.io/ws/full".into(), ss, None, h, tx)));
         }
         V::Apex => {
             let m = by(&subs, |x| x.id.clone());
@@ -286,7 +287,7 @@ pub fn spawn(v: V, subs: Vec<Sub>, tx: UnboundedSender<Ev>) {
                     }
                 }
             });
-            tokio::spawn(run_ws("ApeX", "wss://quote.omni.apex.exchange/realtime_public?v=2".into(), vec![json!({"op": "subscribe", "args": args})], Some(json!({"op": "ping", "args": []})), h, tx));
+            hs.push(tokio::spawn(run_ws("ApeX", "wss://quote.omni.apex.exchange/realtime_public?v=2".into(), vec![json!({"op": "subscribe", "args": args})], Some(json!({"op": "ping", "args": []})), h, tx)));
         }
         V::Edgex => {
             let m = by(&subs, |x| x.id.clone());
@@ -324,7 +325,7 @@ pub fn spawn(v: V, subs: Vec<Sub>, tx: UnboundedSender<Ev>) {
                     }
                 }
             });
-            tokio::spawn(run_ws("edgeX", "wss://edgex-quote-prod-v2.edgex.exchange/api/v1/public/ws".into(), ss, None, h, tx));
+            hs.push(tokio::spawn(run_ws("edgeX", "wss://edgex-quote-prod-v2.edgex.exchange/api/v1/public/ws".into(), ss, None, h, tx)));
         }
         V::Pacifica => {
             let m = by(&subs, |x| x.sym.clone());
@@ -348,7 +349,7 @@ pub fn spawn(v: V, subs: Vec<Sub>, tx: UnboundedSender<Ev>) {
                 }
                 _ => {}
             });
-            tokio::spawn(run_ws("Pacifica", "wss://ws.pacifica.fi/ws".into(), ss, Some(json!({"method": "ping"})), h, tx));
+            hs.push(tokio::spawn(run_ws("Pacifica", "wss://ws.pacifica.fi/ws".into(), ss, Some(json!({"method": "ping"})), h, tx)));
         }
         V::Standx => {
             let m = by(&subs, |x| x.sym.clone());
@@ -374,12 +375,13 @@ pub fn spawn(v: V, subs: Vec<Sub>, tx: UnboundedSender<Ev>) {
                     _ => {}
                 }
             });
-            tokio::spawn(run_ws("StandX", "wss://perps.standx.com/ws-stream/v1".into(), ss, None, h, tx));
+            hs.push(tokio::spawn(run_ws("StandX", "wss://perps.standx.com/ws-stream/v1".into(), ss, None, h, tx)));
         }
         V::Gmx => {
-            tokio::spawn(gmx_poll(subs, tx));
+            hs.push(tokio::spawn(gmx_poll(subs, tx)));
         }
     }
+    hs
 }
 
 /// GMX: the oracle's min / max each second (no stream; no trades published here).
@@ -421,20 +423,105 @@ pub async fn plan(h: &crate::http::Http, assets: &[String]) -> Vec<(V, Vec<Sub>)
     out
 }
 
-pub async fn run(h: &crate::http::Http, assets: Vec<String>, hours: f64) -> Result<()> {
+/// An underlying's funding across the venues now (GMX left out: its side-specific pool rates).
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct Rank {
+    pub asset: String,
+    pub venues: usize,
+    /// max - min of the venues' hourly rates, x 8760 x 100: the APR a hedge between the two extremes would carry now.
+    pub spread_apr: f64,
+    pub high: (String, f64),
+    pub low: (String, f64),
+}
+
+/// The shared underlyings ranked by the cross-venue funding spread now.
+pub async fn rank(h: &crate::http::Http) -> Vec<Rank> {
+    let reg = Registry::load(h, &ALL).await;
+    let shared = reg.shared();
+    let mut per_venue: HashMap<V, Vec<Instrument>> = HashMap::new();
+    for i in shared.values().flatten() {
+        let v = registry::venue_of(i);
+        if v != V::Gmx {
+            per_venue.entry(v).or_default().push(i.clone());
+        }
+    }
+    let got = futures::future::join_all(per_venue.iter().map(|(v, ins)| async move {
+        (*v, tokio::time::timeout(Duration::from_secs(120), v.funding_now(h, ins)).await.ok().and_then(|r| r.ok()).unwrap_or_default(), ins)
+    }))
+    .await;
+    let mut rates: HashMap<String, Vec<(String, f64)>> = HashMap::new();
+    for (v, fs, ins) in got {
+        let by_sym: HashMap<&str, &Instrument> = ins.iter().map(|i| (i.symbol.as_str(), i)).collect();
+        for fnow in fs {
+            if let Some(i) = by_sym.get(fnow.symbol.as_str()) {
+                if fnow.rate_h.is_finite() {
+                    rates.entry(i.base.clone()).or_default().push((v.name().to_string(), fnow.rate_h));
+                }
+            }
+        }
+    }
+    let mut out: Vec<Rank> = rates
+        .into_iter()
+        .filter(|(_, v)| v.len() >= 2)
+        .map(|(asset, v)| {
+            let hi = v.iter().cloned().max_by(|a, b| a.1.total_cmp(&b.1)).unwrap();
+            let lo = v.iter().cloned().min_by(|a, b| a.1.total_cmp(&b.1)).unwrap();
+            Rank { asset, venues: v.len(), spread_apr: (hi.1 - lo.1) * 8760.0 * 100.0, high: (hi.0, hi.1 * 8760.0 * 100.0), low: (lo.0, lo.1 * 8760.0 * 100.0) }
+        })
+        .collect();
+    out.sort_by(|a, b| b.spread_apr.total_cmp(&a.spread_apr));
+    out
+}
+
+/// The re-rank: right after each hour's funding payment (the user's call: the venues pay every hour), at :02.
+fn next_rerank_ms(t: i64) -> i64 {
+    (t / 3_600_000 + 1) * 3_600_000 + 120_000
+}
+
+/// `fixed`: the assets given; None: the `top` by the cross-venue funding spread, re-ranked each hour after the payment
+/// (the streams restarted on the new list).
+pub async fn run(h: &crate::http::Http, fixed: Option<Vec<String>>, top: usize, hours: f64) -> Result<()> {
     let _ = rustls::crypto::ring::default_provider().install_default();
-    let plan = plan(h, &assets).await;
-    for (v, s_) in &plan {
-        println!("{:<11} {} streams: {}", v.name(), s_.len(), s_.iter().map(|x| x.sym.as_str()).collect::<Vec<_>>().join(" "));
-    }
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Ev>();
-    for (v, s_) in plan {
-        spawn(v, s_, tx.clone());
-    }
-    drop(tx);
+    let start = now_ms();
     let dir = crate::data_dir().join("ws");
     std::fs::create_dir_all(&dir)?;
-    let start = now_ms();
+    loop {
+        let assets = match &fixed {
+            Some(a) => a.clone(),
+            None => {
+                let r = rank(h).await;
+                println!("[{}] the funding spread now (APR between the venues' extremes), the top {top}:", now_ms() / 1000);
+                for x in r.iter().take(top) {
+                    println!("  {:<10} {:>7.1}%  {} venues, high {} {:+.1}%, low {} {:+.1}%", x.asset, x.spread_apr, x.venues, x.high.0, x.high.1, x.low.0, x.low.1);
+                }
+                let _ = std::fs::write(dir.join(format!("assets_{}.json", now_ms() / 1000)), serde_json::to_string_pretty(&r.iter().take(top).collect::<Vec<_>>()).unwrap_or_default());
+                r.into_iter().take(top).map(|x| x.asset).collect()
+            }
+        };
+        let plan = plan(h, &assets).await;
+        for (v, s_) in &plan {
+            println!("{:<11} {} streams: {}", v.name(), s_.len(), s_.iter().map(|x| x.sym.as_str()).collect::<Vec<_>>().join(" "));
+        }
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Ev>();
+        let mut handles = Vec::new();
+        for (v, s_) in plan {
+            handles.extend(spawn(v, s_, tx.clone()));
+        }
+        drop(tx);
+        let end_all = if hours > 0.0 { start + (hours * 3.6e6) as i64 } else { i64::MAX };
+        let until = if fixed.is_some() { end_all } else { end_all.min(next_rerank_ms(now_ms())) };
+        write(rx, &dir, until).await?;
+        for hd in handles {
+            hd.abort();
+        }
+        if now_ms() >= end_all {
+            return Ok(());
+        }
+    }
+}
+
+/// The writer: the events to data/ws/<day>.csv until `until_ms`, a health line a minute.
+async fn write(mut rx: tokio::sync::mpsc::UnboundedReceiver<Ev>, dir: &std::path::Path, until_ms: i64) -> Result<()> {
     let mut day = -1i64;
     let mut out: Option<std::io::BufWriter<std::fs::File>> = None;
     let mut last: HashMap<(&'static str, String), (f64, f64, f64, f64)> = HashMap::new();
@@ -469,15 +556,18 @@ pub async fn run(h: &crate::http::Http, assets: Vec<String>, hours: f64) -> Resu
                         seen.insert(venue, t);
                     }
                 }
+                if t >= until_ms { break; }
             }
-            _ = flush.tick() => { if let Some(o) = out.as_mut() { let _ = o.flush(); } }
+            _ = flush.tick() => {
+                if let Some(o) = out.as_mut() { let _ = o.flush(); }
+                if now_ms() >= until_ms { break; }
+            }
             _ = report.tick() => {
                 let t = now_ms();
                 let line: Vec<String> = ALL.iter().map(|v| { let n = v.name(); format!("{n} {}/{} ({}s)", nb.get(n).unwrap_or(&0), nt.get(n).unwrap_or(&0), seen.get(n).map_or(-1, |x| (t - x) / 1000)) }).collect();
                 println!("[{}] book changes / trades a minute (last msg age): {}", t / 1000, line.join(" | "));
                 nb.clear();
                 nt.clear();
-                if hours > 0.0 && (t - start) as f64 >= hours * 3.6e6 { break; }
             }
         }
     }

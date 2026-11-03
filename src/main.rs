@@ -7,7 +7,8 @@
 //!   dexarb history [--days D] [--assets N]        the funding history of the shared assets to data/funding (deliverable 5)
 //!   dexarb research                    the funding-only / funding+basis studies on that history (deliverables 5, 7)
 //!   dexarb basis [--days D] [--assets N]          the level-B basis study on 15-min closes (deliverables 5, 7)
-//!   dexarb ws [--assets A,B,..] [--hours H]       the WebSocket collector: best bid / ask + trades on all ten venues
+//!   dexarb ws [--top N | --assets A,B,..] [--hours H]  the WebSocket collector (default: the top 25 by the funding spread, re-ranked each hour)
+//!   dexarb fundrank [--top N]                     the shared assets by the cross-venue funding spread now
 //!   dexarb collect [--every S]         the forward collector + the paper engine (deliverables 5 level D, 6)
 
 mod averaging;
@@ -70,9 +71,16 @@ async fn main() -> Result<()> {
         }
         "research" => research::run(),
         "ws" => {
-            let assets: Vec<String> = args.iter().position(|a| a == "--assets").and_then(|i| args.get(i + 1)).cloned().unwrap_or_else(|| ws::DEFAULT_ASSETS.into())
-                .split(',').map(|x| x.trim().to_uppercase()).filter(|x| !x.is_empty()).collect();
-            ws::run(&h, assets, arg(&args, "--hours", 0.0)).await
+            // --assets A,B,..: a fixed list; else the --top N (25) by the cross-venue funding spread, re-ranked each hour
+            let fixed: Option<Vec<String>> = args.iter().position(|a| a == "--assets").and_then(|i| args.get(i + 1))
+                .map(|x| x.split(',').map(|y| y.trim().to_uppercase()).filter(|y| !y.is_empty()).collect());
+            ws::run(&h, fixed, arg(&args, "--top", 25.0) as usize, arg(&args, "--hours", 0.0)).await
+        }
+        "fundrank" => {
+            for x in ws::rank(&h).await.iter().take(arg(&args, "--top", 40.0) as usize) {
+                println!("{:<10} {:>7.1}% APR  {} venues  high {} {:+.1}%  low {} {:+.1}%", x.asset, x.spread_apr, x.venues, x.high.0, x.high.1, x.low.0, x.low.1);
+            }
+            Ok(())
         }
         "basis" => basis::run(&h, arg(&args, "--days", 30.0), arg(&args, "--assets", 25.0) as usize).await,
         "collect" => {
