@@ -22,3 +22,10 @@ Settlement mechanics per the venues' docs:
 - **GRVT:** "Funding is applied at the settlement timestamp. If you are flat at that instant, you don't pay or receive." It switches to 1 h when the average premium would exceed the cap.
 - **edgeX:** "Only traders holding positions at the time of settlement are liable."
 - **Aster:** charged at the interval's timestamp, with a ~15 s deviation.
+
+## The price corridor: making the carry's round trip cheap
+
+| # | Lever | Test | Result |
+|---|---|---|---|
+| 6 | Patient entry / exit (`patient.py`) | wait up to 2–24 h for the pair's price to be x bp in our favour; fill on the next bar | +1 to +3 bp of price at most. The taker round trip on these coins is 36 bp. **Not the lever.** |
+| 7 | Cheap venue pairs (`DEXARB_MAX_RT_BP`, `cheap_pairs.py`) | the carry rules on pairs whose maker-taker round trip is ≤ 8 bp (a limit on Aster / Extended, maker 0; the hedge at market on Lighter, taker 0) | With the old spread table (Lighter assumed at 1.8 bp): positive almost everywhere, e.g. +12.5 / +15.6 bp. With the spreads measured on all 1,681 markets (Lighter median 4.6 bp, p90 19): 50% / 4 h / 72 h gives 158 / 134 trades at +3.8 / +4.6 bp, 57% win. The rule chosen on half 1 (50% / 8 h / 72 h): +4.3 / +11.5 bp on 60 / 41 trades. The earlier best (100% / 8 / 72, +20 bp) was UNITREE: without the top 10 assets ≈ 0. **A thin corridor (~+4 bp a trade, ~3 days):** it rests on the maker leg filling at its touch and +2 bp of slippage, both unmeasured over hours. Next: a forward paper run on these pairs only. |

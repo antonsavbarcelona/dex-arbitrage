@@ -242,6 +242,7 @@ pub fn run() -> Result<()> {
 ")?;
     writeln!(rep, "| theta (APR) | held m h | half 1: trades / mean bp (taker) / (maker-taker) | half 2: trades / mean bp (taker) / (maker-taker) / win (m-t) / mean hold h |")?;
     writeln!(rep, "|---|---|---|---|")?;
+    let max_rt_bp: f64 = std::env::var("DEXARB_MAX_RT_BP").ok().and_then(|x| x.parse().ok()).unwrap_or(f64::MAX);
     let dump: std::cell::RefCell<Option<Vec<serde_json::Value>>> = std::cell::RefCell::new(None);
     let trade_x = |theta: f64, m: usize, half: bool, maker: bool, exit_frac: f64, min_hold_h: i64| -> (usize, f64, usize, f64) {
         let (mut n, mut tot, mut wins, mut hold) = (0usize, 0.0, 0usize, 0.0);
@@ -260,6 +261,10 @@ pub fn run() -> Result<()> {
                     } else {
                         2.0 * (la.taker + sb.taker) + la.spread + sb.spread
                     };
+                    // research: only the pairs whose round trip is under DEXARB_MAX_RT_BP (the cheap venue pairs)
+                    if rt * 1e4 > max_rt_bp {
+                        continue;
+                    }
                     let mut i = 0;
                     while i < hours.len() {
                         let h = hours[i];
