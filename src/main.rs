@@ -78,6 +78,7 @@ async fn main() -> Result<()> {
         "research" => research::run(),
         "fstab" => fstab::run(),
         "lev" => lev::run(&h).await,
+        "bars" => lev::fetch_bars(&h, arg(&args, "--days", 30.0), args.iter().any(|a| a == "--stocks")).await,
         "mt" => mt::run(&h, &args[2..]).await,
         "ws" => {
             // --assets A,B,..: a fixed list; else the --top N (25) by the cross-venue funding spread, re-ranked each hour

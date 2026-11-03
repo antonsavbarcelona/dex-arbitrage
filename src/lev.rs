@@ -407,3 +407,46 @@ pub async fn run(h: &crate::http::Http) -> Result<()> {
     println!("{rep}");
     Ok(())
 }
+
+/// `dexarb bars [--days D] [--stocks]`: 15-min bars (close, high, low) of every shared market (--stocks: the
+/// underlyings with a Hyperliquid HIP-3 market) on every venue with public bars, over the last D days, to
+/// data/lev_bars/<base>__<venue>.csv (a file there kept).
+pub async fn fetch_bars(h: &crate::http::Http, days: f64, stocks: bool) -> Result<()> {
+    let reg = Registry::load(h, &ALL).await;
+    let shared = reg.shared();
+    let to = crate::model::now_ms();
+    let from = to - (days * 86_400_000.0) as i64;
+    let bdir = crate::data_dir().join("lev_bars");
+    std::fs::create_dir_all(&bdir)?;
+    let mut todo = Vec::new();
+    for (_, v) in &shared {
+        if stocks && !v.iter().any(|i| i.venue == "Hyperliquid" && i.category.starts_with("hip3")) {
+            continue;
+        }
+        for i in v {
+            if matches!(registry::venue_of(i), V::Lighter | V::Gmx) {
+                continue;
+            }
+            let p = bdir.join(format!("{}__{}.csv", i.base.replace([':', '/'], "_"), i.venue));
+            if !p.exists() {
+                todo.push((i.clone(), p));
+            }
+        }
+    }
+    println!("{} to fetch", todo.len());
+    for c in todo.chunks(4) {
+        let r = futures::future::join_all(c.iter().map(|(i, p)| async move { (i, p, candles::candles(registry::venue_of(i), h, i, from, to).await) })).await;
+        for (i, p, x) in r {
+            match x {
+                Ok(v) if v.len() > 20 => {
+                    let body: String = v.iter().map(|b| format!("{},{},{},{}\n", b.ts, b.close, b.hi, b.lo)).collect();
+                    let _ = std::fs::write(p, body);
+                }
+                Ok(v) => eprintln!("{} {}: {} bars", i.venue, i.base, v.len()),
+                Err(e) => eprintln!("{} {}: {e:#}", i.venue, i.base),
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+    }
+    Ok(())
+}

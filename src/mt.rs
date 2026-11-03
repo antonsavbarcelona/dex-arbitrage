@@ -28,12 +28,14 @@ struct Bb {
     bid: f64,
     bsz: f64,
     ask: f64,
+    asz: f64,
 }
 
 #[derive(Clone, Copy)]
 struct Tr {
     t: i64,
     px: f64,
+    sz: f64,
     side: i8,
 }
 
@@ -68,15 +70,15 @@ fn load(only: &Option<Vec<String>>) -> Result<BTreeMap<String, HashMap<String, S
             let s = m.entry(x[4].to_string()).or_default().entry(x[3].to_string()).or_default();
             match x[0] {
                 "B" if x.len() >= 9 => {
-                    let (bid, bsz, ask) = (x[5].parse().unwrap_or(0.0), x[6].parse().unwrap_or(0.0), x[7].parse().unwrap_or(0.0));
+                    let (bid, bsz, ask, asz) = (x[5].parse().unwrap_or(0.0), x[6].parse().unwrap_or(0.0), x[7].parse().unwrap_or(0.0), x[8].parse().unwrap_or(0.0));
                     if bid > 0.0 && ask > 0.0 && ask >= bid {
-                        s.bb.push(Bb { t, bid, bsz, ask });
+                        s.bb.push(Bb { t, bid, bsz, ask, asz });
                     }
                 }
                 "T" => {
                     let px: f64 = x[5].parse().unwrap_or(0.0);
                     if px > 0.0 {
-                        s.tr.push(Tr { t, px, side: x[7].parse().unwrap_or(0) });
+                        s.tr.push(Tr { t, px, sz: x[6].parse().unwrap_or(0.0), side: x[7].parse().unwrap_or(0) });
                     }
                 }
                 _ => {}
@@ -120,6 +122,15 @@ struct P<'a> {
     /// The venues' own delays: A's on posting / cancelling a limit (the quote that much staler), B's on a taker order.
     a_maker_ms: i64,
     b_taker_ms: i64,
+    /// Our size ($): a fill needs a print of at least this notional through the quote; the hedge needs B's best level to
+    /// hold it (else the trip is not taken / the exit waits) - 0: no size checks. GMX (no book sizes): unchecked.
+    usd: f64,
+}
+
+/// B's best level on the hedge's side holds our size (a venue publishing no sizes - 0 - passes).
+fn holds(h: &Bb, buy_b: bool, usd: f64) -> bool {
+    let (px, sz) = if buy_b { (h.ask, h.asz) } else { (h.bid, h.bsz) };
+    usd <= 0.0 || sz <= 0.0 || px * sz >= usd
 }
 
 /// A venue's built-in delays (ms): (on a maker / cancel action, on a taker order). Lighter (apidocs.lighter.xyz, account
@@ -166,10 +177,15 @@ fn sim(p: &P, target: f64, lq: i64, lh: i64, hold_ms: i64, mid_t: i64) -> Res {
                 let buy = bq.bid / (1.0 + m) * (1.0 - edge);
                 let sell = bq.ask / (1.0 + m) * (1.0 + edge);
                 // a sell print under our resting bid (a bid that would not cross A's ask)
-                let fill_buy = buy < aq.ask && tr.px < buy && tr.side <= 0;
-                let fill_sell = sell > aq.bid && tr.px > sell && tr.side >= 0;
+                let big = p.usd <= 0.0 || tr.px * tr.sz >= p.usd;
+                let fill_buy = big && buy < aq.ask && tr.px < buy && tr.side <= 0;
+                let fill_sell = big && sell > aq.bid && tr.px > sell && tr.side >= 0;
                 if fill_buy || fill_sell {
                     let Some(h) = at(&p.b.bb, tr.t + lh + p.b_taker_ms) else { continue };
+                    // the hedge sells B on a long A (its bid), buys B on a short A
+                    if !holds(&h, !fill_buy, p.usd) {
+                        continue;
+                    }
                     let dir: i8 = if fill_buy { 1 } else { -1 };
                     let (pa, pb) = if fill_buy { (buy, h.bid) } else { (sell, h.ask) };
                     let ref_b = if fill_buy { at(&p.b.bb, tr.t).map_or(h.bid, |x| x.bid) } else { at(&p.b.bb, tr.t).map_or(h.ask, |x| x.ask) };
@@ -181,7 +197,8 @@ fn sim(p: &P, target: f64, lq: i64, lh: i64, hold_ms: i64, mid_t: i64) -> Res {
             Some((dir, pa, pb, t_in)) => {
                 let forced = tr.t - t_in >= hold_ms;
                 let close = if dir > 0 { bq.ask / (1.0 + m) * (1.0 + edge) } else { bq.bid / (1.0 + m) * (1.0 - edge) };
-                let filled = if dir > 0 { close > aq.bid && tr.px > close && tr.side >= 0 } else { close < aq.ask && tr.px < close && tr.side <= 0 };
+                let big = p.usd <= 0.0 || tr.px * tr.sz >= p.usd;
+                let filled = big && if dir > 0 { close > aq.bid && tr.px > close && tr.side >= 0 } else { close < aq.ask && tr.px < close && tr.side <= 0 };
                 if !(filled || forced) {
                     continue;
                 }
@@ -215,12 +232,14 @@ pub async fn run(h: &crate::http::Http, args: &[String]) -> Result<()> {
     let arg = |k: &str, d: f64| args.iter().position(|a| a == k).and_then(|i| args.get(i + 1)).and_then(|x| x.parse::<f64>().ok()).unwrap_or(d);
     let (lq, lh, hold) = (arg("--lq", 200.0) as i64, arg("--lh", 300.0) as i64, (arg("--hold-min", 240.0) * 60_000.0) as i64);
     let premium = args.iter().any(|a| a == "--lighter-premium");
+    let usd = arg("--usd", 0.0);
     let only: Option<Vec<String>> = args.iter().position(|a| a == "--assets").and_then(|i| args.get(i + 1)).map(|x| x.split(',').map(|y| y.trim().to_uppercase()).collect());
     let reg = Registry::load(h, &ALL).await;
     let fees: HashMap<(String, String), (f64, f64)> = reg.by_venue.values().flatten().map(|i| ((i.venue.clone(), i.base.clone()), (f(i.fees.maker), f(i.fees.taker)))).collect();
     let data = load(&only)?;
     let (tmin, tmax) = data.values().flat_map(|v| v.values()).flat_map(|s| s.bb.first().zip(s.bb.last())).fold((i64::MAX, 0i64), |a, (x, y)| (a.0.min(x.t), a.1.max(y.t)));
     let mid_t = tmin + (tmax - tmin) / 2;
+    println!("our size ${usd} (a fill needs a print of it through the quote; the hedge B's best level holding it)");
     println!("data: {} assets, {:.1} h ({} .. {}); the quote off B's book {} ms old, the hedge {} ms after the fill (+ the venue's own delay: Lighter {}), out at market after {} min",
         data.len(), (tmax - tmin) as f64 / 3.6e6, tmin / 1000, tmax / 1000, lq, lh, if premium { "premium 0 / 200 ms, fees 0.004% / 0.028%" } else { "standard 200 / 300 ms, fees 0 / 0" }, hold / 60_000);
     let targets = [0.0, 5e-4, 1e-3, 2e-3];
@@ -249,7 +268,7 @@ pub async fn run(h: &crate::http::Http, args: &[String]) -> Result<()> {
                 };
                 let (fa, fb) = (fee(va), fee(vb));
                 let (ba, bb) = (bumps(va, premium), bumps(vb, premium));
-                let p = P { a: sa, b: sb, fee_a_maker: fa.0, fee_a_taker: fa.1, fee_b_taker: fb.1, a_maker_ms: ba.0, b_taker_ms: bb.1 };
+                let p = P { a: sa, b: sb, fee_a_maker: fa.0, fee_a_taker: fa.1, fee_b_taker: fb.1, a_maker_ms: ba.0, b_taker_ms: bb.1, usd };
                 for (k, &tg) in targets.iter().enumerate() {
                     let r = sim(&p, tg, lq, lh, hold, mid_t);
                     if r.trips > 0 {
@@ -279,6 +298,26 @@ pub async fn run(h: &crate::http::Http, args: &[String]) -> Result<()> {
             t.first_half / t.n_first.max(1) as f64 * 1e4, (t.sum - t.first_half) / h2.max(1) as f64 * 1e4);
     }
     rows.sort_by(|a, b| b.4.sum.total_cmp(&a.4.sum));
+    // the concentration at the 10 bp target: the share of the top assets, the rest's mean
+    {
+        let mut by: HashMap<&str, (f64, usize, f64)> = HashMap::new();
+        for (asset, _, _, tg, r, _) in rows.iter().filter(|x| (x.3 - 1e-3).abs() < 1e-9) {
+            let e = by.entry(asset.as_str()).or_default();
+            e.0 += r.sum;
+            e.1 += r.trips;
+            e.2 += r.first_half;
+            let _ = tg;
+        }
+        let mut v: Vec<_> = by.into_iter().collect();
+        v.sort_by(|a, b| b.1 .0.total_cmp(&a.1 .0));
+        let tot: f64 = v.iter().map(|x| x.1 .0).sum();
+        println!("\n10 bp target by asset: {} assets, total {:.0} bp; the top: {}", v.len(), tot * 1e4, v.iter().take(10).map(|(a, x)| format!("{a} {:+.0} ({})", x.0 * 1e4, x.1)).collect::<Vec<_>>().join(", "));
+        for k in [5usize, 10, 20] {
+            let rest: Vec<_> = v.iter().skip(k).collect();
+            let (s_, n_) = rest.iter().fold((0.0, 0usize), |a, x| (a.0 + x.1 .0, a.1 + x.1 .1));
+            println!("  without the top {k}: {} trips, mean {:+.2} bp, total {:+.0} bp; assets positive {} / {}", n_, s_ / n_.max(1) as f64 * 1e4, s_ * 1e4, rest.iter().filter(|x| x.1 .0 > 0.0).count(), rest.len());
+        }
+    }
     println!("\nthe best pairs (A = the limit's venue, B = the hedge's), total bp over the data:");
     println!("{:<10} {:<11} {:<11} {:>6} {:>6} {:>7} {:>8} {:>9} {:>9} {:>8}", "asset", "A (limit)", "B (hedge)", "target", "trips", "win", "forced", "mean bp", "total bp", "fees bp");
     for (asset, va, vb, tg, r, fee) in rows.iter().filter(|x| x.4.trips >= 3).take(40) {
