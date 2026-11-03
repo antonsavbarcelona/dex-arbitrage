@@ -91,7 +91,23 @@ type Handler = Box<dyn FnMut(&Value, &mut HashMap<String, Lb>, &UnboundedSender<
 
 /// One connection: the subscriptions sent, every text frame to `h` (which may queue replies), an app-level ping every
 /// 20 s when the venue wants one, out when silent 60 s or closed. Reconnects forever with a 1 .. 30 s backoff.
+/// The connections a venue has opened this run: the k-th waits k x its stagger before it subscribes (Lighter counts the
+/// messages a client sends: two connections subscribing at once draw Too Many Websocket Messages).
+static OPENED: std::sync::Mutex<Option<HashMap<&'static str, u64>>> = std::sync::Mutex::new(None);
+
+fn stagger_s(venue: &str) -> u64 {
+    if venue == "Lighter" { 75 } else { 1 }
+}
+
 async fn run_ws(venue: &'static str, url: String, subs: Vec<Value>, ping: Option<Value>, mut h: Handler, tx: UnboundedSender<Ev>) {
+    let k = {
+        let mut g = OPENED.lock().unwrap();
+        let m = g.get_or_insert_with(HashMap::new);
+        let e = m.entry(venue).or_insert(0);
+        *e += 1;
+        *e - 1
+    };
+    tokio::time::sleep(Duration::from_secs(k * stagger_s(venue))).await;
     let mut backoff = 1u64;
     loop {
         let started = std::time::Instant::now();
@@ -101,8 +117,10 @@ async fn run_ws(venue: &'static str, url: String, subs: Vec<Value>, ping: Option
             let mut rq = url.as_str().into_client_request()?;
             rq.headers_mut().insert("User-Agent", "dexarb-research/0.1 (read-only)".parse()?);
             let (mut ws, _) = tokio::time::timeout(Duration::from_secs(15), tokio_tungstenite::connect_async(rq)).await.map_err(|_| anyhow!("connect timeout"))??;
+            // paced: a venue may refuse a burst (Lighter: Too Many Inflight Messages)
             for m in &subs {
                 ws.send(Message::Text(m.to_string())).await?;
+                tokio::time::sleep(Duration::from_millis(if venue == "Lighter" { 60 } else { 25 })).await;
             }
             let mut books: HashMap<String, Lb> = HashMap::new();
             let mut tick = tokio::time::interval(Duration::from_secs(20));
@@ -156,7 +174,29 @@ fn by<'a>(subs: &'a [Sub], key: impl Fn(&Sub) -> String) -> HashMap<String, Sub>
 }
 
 /// The venues' streams.
+/// The subscriptions a connection carries at most (the venues' limits; Extended streams every market on one connection,
+/// StandX has few markets, GMX is polled).
+fn per_conn(v: V) -> usize {
+    match v {
+        V::Hyperliquid => 120,
+        V::Aster => 100,
+        V::Grvt => 30,
+        // Lighter: the books (one connection) and the trades (another, 75 s later) of every market
+        V::Lighter => usize::MAX,
+        V::Apex | V::Edgex | V::Pacifica => 50,
+        V::Extended | V::Standx | V::Gmx => usize::MAX,
+    }
+}
+
 pub fn spawn(v: V, subs: Vec<Sub>, tx: UnboundedSender<Ev>) -> Vec<tokio::task::JoinHandle<()>> {
+    let n = per_conn(v);
+    if subs.len() <= n {
+        return spawn_one(v, subs, tx);
+    }
+    subs.chunks(n).flat_map(|c| spawn_one(v, c.to_vec(), tx.clone())).collect()
+}
+
+fn spawn_one(v: V, subs: Vec<Sub>, tx: UnboundedSender<Ev>) -> Vec<tokio::task::JoinHandle<()>> {
     let mut hs = Vec::new();
     if subs.is_empty() {
         return hs;
@@ -186,8 +226,10 @@ pub fn spawn(v: V, subs: Vec<Sub>, tx: UnboundedSender<Ev>) -> Vec<tokio::task::
         }
         V::Lighter => {
             let m = by(&subs, |x| x.id.clone());
-            let ss = subs.iter().flat_map(|x| [json!({"type": "subscribe", "channel": format!("order_book/{}", x.id)}), json!({"type": "subscribe", "channel": format!("trade/{}", x.id)})]).collect();
-            let h: Handler = Box::new(move |v, books, tx, _r| {
+            // the books on one connection, the trades on another (75 s later): ~190 channels each is fine, both kinds on one is not
+            let sb: Vec<Value> = subs.iter().map(|x| json!({"type": "subscribe", "channel": format!("order_book/{}", x.id)})).collect();
+            let st: Vec<Value> = subs.iter().map(|x| json!({"type": "subscribe", "channel": format!("trade/{}", x.id)})).collect();
+            let mk = move |m: HashMap<String, Sub>| -> Handler { Box::new(move |v, books, tx, _r| {
                 let ch = s(&v["channel"]);
                 if let Some(id) = ch.strip_prefix("order_book:") {
                     let Some(x) = m.get(id) else { return };
@@ -208,26 +250,28 @@ pub fn spawn(v: V, subs: Vec<Sub>, tx: UnboundedSender<Ev>) -> Vec<tokio::task::
                         trade(tx, "Lighter", x, num(&t["price"]), num(&t["size"]), side, t["timestamp"].as_i64());
                     }
                 }
-            });
-            hs.push(tokio::spawn(run_ws("Lighter", "wss://mainnet.zklighter.elliot.ai/stream".into(), ss, None, h, tx)));
+            }) };
+            hs.push(tokio::spawn(run_ws("Lighter", "wss://mainnet.zklighter.elliot.ai/stream".into(), sb, None, mk(m.clone()), tx.clone())));
+            hs.push(tokio::spawn(run_ws("Lighter", "wss://mainnet.zklighter.elliot.ai/stream".into(), st, None, mk(m), tx)));
         }
         V::Extended => {
-            for x in subs {
-                let (xb, xt) = (x.clone(), x.clone());
-                let hb: Handler = Box::new(move |v, _b, tx, _r| {
-                    let d = &v["data"];
-                    let (b, a) = (&d["b"][0], &d["a"][0]);
-                    bbo(tx, "Extended", &xb, Some((num(&b["p"]), num(&b["q"]), num(&a["p"]), num(&a["q"]))), v["ts"].as_i64());
-                });
-                let ht: Handler = Box::new(move |v, _b, tx, _r| {
-                    for t in v["data"].as_array().into_iter().flatten() {
-                        trade(tx, "Extended", &xt, num(&t["p"]), num(&t["q"]), if t["S"] == "BUY" { 1 } else { -1 }, t["T"].as_i64());
-                    }
-                });
-                let base = "wss://api.starknet.extended.exchange/stream.extended.exchange/v1";
-                hs.push(tokio::spawn(run_ws("Extended", format!("{base}/orderbooks/{}?depth=1", x.sym), vec![], None, hb, tx.clone())));
-                hs.push(tokio::spawn(run_ws("Extended", format!("{base}/publicTrades/{}", x.sym), vec![], None, ht, tx.clone())));
-            }
+            // every market on one connection each (the market in the message); ours kept
+            let (mb, mt) = (by(&subs, |x| x.sym.clone()), by(&subs, |x| x.sym.clone()));
+            let hb: Handler = Box::new(move |v, _b, tx, _r| {
+                let d = &v["data"];
+                let Some(x) = mb.get(&s(&d["m"])) else { return };
+                let (b, a) = (&d["b"][0], &d["a"][0]);
+                bbo(tx, "Extended", x, Some((num(&b["p"]), num(&b["q"]), num(&a["p"]), num(&a["q"]))), v["ts"].as_i64());
+            });
+            let ht: Handler = Box::new(move |v, _b, tx, _r| {
+                for t in v["data"].as_array().into_iter().flatten() {
+                    let Some(x) = mt.get(&s(&t["m"])) else { continue };
+                    trade(tx, "Extended", x, num(&t["p"]), num(&t["q"]), if t["S"] == "BUY" { 1 } else { -1 }, t["T"].as_i64());
+                }
+            });
+            let base = "wss://api.starknet.extended.exchange/stream.extended.exchange/v1";
+            hs.push(tokio::spawn(run_ws("Extended", format!("{base}/orderbooks?depth=1"), vec![], None, hb, tx.clone())));
+            hs.push(tokio::spawn(run_ws("Extended", format!("{base}/publicTrades"), vec![], None, ht, tx.clone())));
         }
         V::Aster => {
             let m = by(&subs, |x| x.sym.to_lowercase());
@@ -481,6 +525,7 @@ fn next_rerank_ms(t: i64) -> i64 {
 /// `fixed`: the assets given; None: the `top` by the cross-venue funding spread, re-ranked each hour after the payment
 /// (the streams restarted on the new list).
 pub async fn run(h: &crate::http::Http, fixed: Option<Vec<String>>, top: usize, hours: f64) -> Result<()> {
+    let all = top == 0;
     let _ = rustls::crypto::ring::default_provider().install_default();
     let start = now_ms();
     let dir = crate::data_dir().join("ws");
@@ -488,6 +533,12 @@ pub async fn run(h: &crate::http::Http, fixed: Option<Vec<String>>, top: usize, 
     loop {
         let assets = match &fixed {
             Some(a) => a.clone(),
+            None if all => {
+                let reg = Registry::load(h, &ALL).await;
+                let a: Vec<String> = reg.shared().into_keys().collect();
+                println!("[{}] every underlying on 2+ venues: {}", now_ms() / 1000, a.len());
+                a
+            }
             None => {
                 let r = rank(h).await;
                 println!("[{}] the funding spread now (APR between the venues' extremes), the top {top}:", now_ms() / 1000);
@@ -503,13 +554,20 @@ pub async fn run(h: &crate::http::Http, fixed: Option<Vec<String>>, top: usize, 
             println!("{:<11} {} streams: {}", v.name(), s_.len(), s_.iter().map(|x| x.sym.as_str()).collect::<Vec<_>>().join(" "));
         }
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Ev>();
+        *OPENED.lock().unwrap() = None;
         let mut handles = Vec::new();
         for (v, s_) in plan {
             handles.extend(spawn(v, s_, tx.clone()));
         }
         drop(tx);
         let end_all = if hours > 0.0 { start + (hours * 3.6e6) as i64 } else { i64::MAX };
-        let until = if fixed.is_some() { end_all } else { end_all.min(next_rerank_ms(now_ms())) };
+        let until = if fixed.is_some() {
+            end_all
+        } else if all {
+            end_all.min(now_ms() + 6 * 3_600_000)
+        } else {
+            end_all.min(next_rerank_ms(now_ms()))
+        };
         write(rx, &dir, until).await?;
         for hd in handles {
             hd.abort();
@@ -523,13 +581,15 @@ pub async fn run(h: &crate::http::Http, fixed: Option<Vec<String>>, top: usize, 
 /// The writer: the events to data/ws/<day>.csv until `until_ms`, a health line a minute.
 async fn write(mut rx: tokio::sync::mpsc::UnboundedReceiver<Ev>, dir: &std::path::Path, until_ms: i64) -> Result<()> {
     let mut day = -1i64;
-    let mut out: Option<std::io::BufWriter<std::fs::File>> = None;
+    let mut out: Option<flate2::write::GzEncoder<std::fs::File>> = None;
     let mut last: HashMap<(&'static str, String), (f64, f64, f64, f64)> = HashMap::new();
     let (mut nb, mut nt) = (HashMap::<&'static str, u64>::new(), HashMap::<&'static str, u64>::new());
     let mut seen: HashMap<&'static str, i64> = HashMap::new();
     let mut report = tokio::time::interval(Duration::from_secs(60));
     let mut flush = tokio::time::interval(Duration::from_secs(1));
     report.tick().await;
+    // a size change worth a line: 10%+ (the prices always)
+    let moved = |a: f64, b: f64| (a - b).abs() > 0.10 * a.abs().max(b.abs());
     loop {
         tokio::select! {
             e = rx.recv() => {
@@ -537,14 +597,18 @@ async fn write(mut rx: tokio::sync::mpsc::UnboundedReceiver<Ev>, dir: &std::path
                 let t = now_ms();
                 if t / 86_400_000 != day {
                     day = t / 86_400_000;
-                    if let Some(mut o) = out.take() { let _ = o.flush(); }
-                    out = Some(std::io::BufWriter::with_capacity(1 << 20, std::fs::OpenOptions::new().create(true).append(true).open(dir.join(format!("{day}.csv")))?));
+                    if let Some(o) = out.take() { let _ = o.finish(); }
+                    // one gzip member a run (members concatenate: gzip -dc / zcat read them all)
+                    let f_ = std::fs::OpenOptions::new().create(true).append(true).open(dir.join(format!("{day}.csv.gz")))?;
+                    out = Some(flate2::write::GzEncoder::new(f_, flate2::Compression::fast()));
                 }
                 let o = out.as_mut().unwrap();
                 match e {
                     Ev::Bbo { venue, asset, bid, bsz, ask, asz, ts_ex } => {
                         let k = (venue, asset.clone());
-                        if last.get(&k) == Some(&(bid, bsz, ask, asz)) { continue; }
+                        if let Some(p) = last.get(&k) {
+                            if p.0 == bid && p.2 == ask && !moved(p.1, bsz) && !moved(p.3, asz) { continue; }
+                        }
                         last.insert(k, (bid, bsz, ask, asz));
                         writeln!(o, "B,{t},{},{venue},{asset},{bid},{bsz},{ask},{asz}", ts_ex.unwrap_or(0))?;
                         *nb.entry(venue).or_default() += 1;
@@ -571,8 +635,8 @@ async fn write(mut rx: tokio::sync::mpsc::UnboundedReceiver<Ev>, dir: &std::path
             }
         }
     }
-    if let Some(mut o) = out.take() {
-        let _ = o.flush();
+    if let Some(o) = out.take() {
+        let _ = o.finish();
     }
     Ok(())
 }

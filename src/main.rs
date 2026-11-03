@@ -7,7 +7,7 @@
 //!   dexarb history [--days D] [--assets N]        the funding history of the shared assets to data/funding (deliverable 5)
 //!   dexarb research                    the funding-only / funding+basis studies on that history (deliverables 5, 7)
 //!   dexarb basis [--days D] [--assets N]          the level-B basis study on 15-min closes (deliverables 5, 7)
-//!   dexarb ws [--top N | --assets A,B,..] [--hours H]  the WebSocket collector (default: the top 25 by the funding spread, re-ranked each hour)
+//!   dexarb ws [--top N | --assets A,B,..] [--hours H]  the WebSocket collector (default: every underlying on 2+ venues; --top N by the funding spread)
 //!   dexarb fundrank [--top N]                     the shared assets by the cross-venue funding spread now
 //!   dexarb collect [--every S]         the forward collector + the paper engine (deliverables 5 level D, 6)
 
@@ -74,7 +74,8 @@ async fn main() -> Result<()> {
             // --assets A,B,..: a fixed list; else the --top N (25) by the cross-venue funding spread, re-ranked each hour
             let fixed: Option<Vec<String>> = args.iter().position(|a| a == "--assets").and_then(|i| args.get(i + 1))
                 .map(|x| x.split(',').map(|y| y.trim().to_uppercase()).filter(|y| !y.is_empty()).collect());
-            ws::run(&h, fixed, arg(&args, "--top", 25.0) as usize, arg(&args, "--hours", 0.0)).await
+            // the default: every underlying on 2+ venues (--top N: the N by the funding spread, re-ranked each hour)
+            ws::run(&h, fixed, arg(&args, "--top", 0.0) as usize, arg(&args, "--hours", 0.0)).await
         }
         "fundrank" => {
             for x in ws::rank(&h).await.iter().take(arg(&args, "--top", 40.0) as usize) {
