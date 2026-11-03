@@ -11,7 +11,9 @@
 //!  * the result of a round trip, fraction of the notional: the entry basis - the exit basis - the fees; the adverse move
 //!    of the hedge (B's best between the fill and the hedge) reported apart. Funding not counted (the holds are short).
 //!
-//! Timestamps: ours (one clock for every venue).  `dexarb mt [--lq MS] [--lh MS] [--hold-min M] [--assets A,B]`
+//! The venues' own delays on top (Lighter standard: 200 ms on a maker / cancel action, 300 ms on a taker order; premium
+//! `--lighter-premium`: 0 / 200 ms and its fees). Timestamps: ours (one clock for every venue).
+//! `dexarb mt [--lq MS] [--lh MS] [--hold-min M] [--assets A,B] [--lighter-premium]`
 
 use crate::model::*;
 use crate::registry::Registry;
@@ -115,6 +117,20 @@ struct P<'a> {
     fee_a_maker: f64,
     fee_a_taker: f64,
     fee_b_taker: f64,
+    /// The venues' own delays: A's on posting / cancelling a limit (the quote that much staler), B's on a taker order.
+    a_maker_ms: i64,
+    b_taker_ms: i64,
+}
+
+/// A venue's built-in delays (ms): (on a maker / cancel action, on a taker order). Lighter (apidocs.lighter.xyz, account
+/// types): a standard account (0 fees) 200 / 300; premium ~0 / ~200 (its fees 0.004% / 0.028% at the 0-LIT tier). The
+/// others publish none: 0 (their network latency is in `--lq` / `--lh`).
+fn bumps(venue: &str, lighter_premium: bool) -> (i64, i64) {
+    match (venue, lighter_premium) {
+        ("Lighter", false) => (200, 300),
+        ("Lighter", true) => (0, 200),
+        _ => (0, 0),
+    }
 }
 
 /// One pair, one target: both directions (long A / short B, short A / long B), one position at a time.
@@ -144,7 +160,7 @@ fn sim(p: &P, target: f64, lq: i64, lh: i64, hold_ms: i64, mid_t: i64) -> Res {
             continue;
         }
         let Some(&m) = mu.get(&(tr.t / 60_000 - 1)) else { continue };
-        let (Some(bq), Some(aq)) = (at(&p.b.bb, tr.t - lq), at(&p.a.bb, tr.t)) else { continue };
+        let (Some(bq), Some(aq)) = (at(&p.b.bb, tr.t - lq - p.a_maker_ms), at(&p.a.bb, tr.t)) else { continue };
         match pos {
             None => {
                 let buy = bq.bid / (1.0 + m) * (1.0 - edge);
@@ -153,7 +169,7 @@ fn sim(p: &P, target: f64, lq: i64, lh: i64, hold_ms: i64, mid_t: i64) -> Res {
                 let fill_buy = buy < aq.ask && tr.px < buy && tr.side <= 0;
                 let fill_sell = sell > aq.bid && tr.px > sell && tr.side >= 0;
                 if fill_buy || fill_sell {
-                    let Some(h) = at(&p.b.bb, tr.t + lh) else { continue };
+                    let Some(h) = at(&p.b.bb, tr.t + lh + p.b_taker_ms) else { continue };
                     let dir: i8 = if fill_buy { 1 } else { -1 };
                     let (pa, pb) = if fill_buy { (buy, h.bid) } else { (sell, h.ask) };
                     let ref_b = if fill_buy { at(&p.b.bb, tr.t).map_or(h.bid, |x| x.bid) } else { at(&p.b.bb, tr.t).map_or(h.ask, |x| x.ask) };
@@ -169,7 +185,7 @@ fn sim(p: &P, target: f64, lq: i64, lh: i64, hold_ms: i64, mid_t: i64) -> Res {
                 if !(filled || forced) {
                     continue;
                 }
-                let Some(h) = at(&p.b.bb, tr.t + lh) else { continue };
+                let Some(h) = at(&p.b.bb, tr.t + lh + p.b_taker_ms) else { continue };
                 let (xa, xb, fa) = if forced {
                     (if dir > 0 { aq.bid } else { aq.ask }, if dir > 0 { h.ask } else { h.bid }, p.fee_a_taker)
                 } else {
@@ -198,14 +214,15 @@ fn sim(p: &P, target: f64, lq: i64, lh: i64, hold_ms: i64, mid_t: i64) -> Res {
 pub async fn run(h: &crate::http::Http, args: &[String]) -> Result<()> {
     let arg = |k: &str, d: f64| args.iter().position(|a| a == k).and_then(|i| args.get(i + 1)).and_then(|x| x.parse::<f64>().ok()).unwrap_or(d);
     let (lq, lh, hold) = (arg("--lq", 200.0) as i64, arg("--lh", 300.0) as i64, (arg("--hold-min", 240.0) * 60_000.0) as i64);
+    let premium = args.iter().any(|a| a == "--lighter-premium");
     let only: Option<Vec<String>> = args.iter().position(|a| a == "--assets").and_then(|i| args.get(i + 1)).map(|x| x.split(',').map(|y| y.trim().to_uppercase()).collect());
     let reg = Registry::load(h, &ALL).await;
     let fees: HashMap<(String, String), (f64, f64)> = reg.by_venue.values().flatten().map(|i| ((i.venue.clone(), i.base.clone()), (f(i.fees.maker), f(i.fees.taker)))).collect();
     let data = load(&only)?;
     let (tmin, tmax) = data.values().flat_map(|v| v.values()).flat_map(|s| s.bb.first().zip(s.bb.last())).fold((i64::MAX, 0i64), |a, (x, y)| (a.0.min(x.t), a.1.max(y.t)));
     let mid_t = tmin + (tmax - tmin) / 2;
-    println!("data: {} assets, {:.1} h ({} .. {}); the quote off B's book {} ms old, the hedge {} ms after the fill, out at market after {} min",
-        data.len(), (tmax - tmin) as f64 / 3.6e6, tmin / 1000, tmax / 1000, lq, lh, hold / 60_000);
+    println!("data: {} assets, {:.1} h ({} .. {}); the quote off B's book {} ms old, the hedge {} ms after the fill (+ the venue's own delay: Lighter {}), out at market after {} min",
+        data.len(), (tmax - tmin) as f64 / 3.6e6, tmin / 1000, tmax / 1000, lq, lh, if premium { "premium 0 / 200 ms, fees 0.004% / 0.028%" } else { "standard 200 / 300 ms, fees 0 / 0" }, hold / 60_000);
     let targets = [0.0, 5e-4, 1e-3, 2e-3];
     let mut rows: Vec<(String, String, String, f64, Res, f64)> = Vec::new();
     let mut tot: Vec<Res> = vec![Res::default(); targets.len()];
@@ -227,8 +244,12 @@ pub async fn run(h: &crate::http::Http, args: &[String]) -> Result<()> {
                 if !(0.98..=1.02).contains(&ratio) {
                     continue;
                 }
-                let (fa, fb) = (fees.get(&(va.clone(), asset.clone())).copied().unwrap_or((0.0002, 0.0005)), fees.get(&(vb.clone(), asset.clone())).copied().unwrap_or((0.0002, 0.0005)));
-                let p = P { a: sa, b: sb, fee_a_maker: fa.0, fee_a_taker: fa.1, fee_b_taker: fb.1 };
+                let fee = |v: &String| {
+                    if v == "Lighter" && premium { (0.00004, 0.00028) } else { fees.get(&(v.clone(), asset.clone())).copied().unwrap_or((0.0002, 0.0005)) }
+                };
+                let (fa, fb) = (fee(va), fee(vb));
+                let (ba, bb) = (bumps(va, premium), bumps(vb, premium));
+                let p = P { a: sa, b: sb, fee_a_maker: fa.0, fee_a_taker: fa.1, fee_b_taker: fb.1, a_maker_ms: ba.0, b_taker_ms: bb.1 };
                 for (k, &tg) in targets.iter().enumerate() {
                     let r = sim(&p, tg, lq, lh, hold, mid_t);
                     if r.trips > 0 {
