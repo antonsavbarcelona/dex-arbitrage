@@ -9,6 +9,7 @@
 //!   dexarb basis [--days D] [--assets N]          the level-B basis study on 15-min closes (deliverables 5, 7)
 //!   dexarb ws [--top N | --assets A,B,..] [--hours H]  the WebSocket collector (default: every underlying on 2+ venues; --top N by the funding spread)
 //!   dexarb fundrank [--top N]                     the shared assets by the cross-venue funding spread now
+//!   dexarb mt [--lq MS] [--lh MS] [--hold-min M]   the maker-taker simulator on the WebSocket data (a limit on A, the hedge at market on B)
 //!   dexarb collect [--every S]         the forward collector + the paper engine (deliverables 5 level D, 6)
 
 mod averaging;
@@ -18,6 +19,7 @@ mod exec;
 mod history;
 mod http;
 mod model;
+mod mt;
 mod paper;
 mod pnl;
 mod registry;
@@ -70,6 +72,7 @@ async fn main() -> Result<()> {
             .await
         }
         "research" => research::run(),
+        "mt" => mt::run(&h, &args[2..]).await,
         "ws" => {
             // --assets A,B,..: a fixed list; else the --top N (25) by the cross-venue funding spread, re-ranked each hour
             let fixed: Option<Vec<String>> = args.iter().position(|a| a == "--assets").and_then(|i| args.get(i + 1))
