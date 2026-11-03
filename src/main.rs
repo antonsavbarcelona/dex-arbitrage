@@ -17,6 +17,7 @@
 mod averaging;
 mod basis;
 mod collect;
+mod corridor;
 mod exec;
 mod fstab;
 mod history;

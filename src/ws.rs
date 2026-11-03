@@ -540,6 +540,26 @@ pub async fn funding_snapshots(h: crate::http::Http, dir: std::path::PathBuf) {
         }))
         .await;
         let day = t / 86_400_000;
+        // the corridor paper run: every rate and every market's fees (GMX left out: no book, an oracle price)
+        {
+            let mut rows = Vec::new();
+            let mut fees = HashMap::new();
+            for (v, fs, ins) in &got {
+                if *v == V::Gmx {
+                    continue;
+                }
+                let by_sym: HashMap<&str, &Instrument> = ins.iter().map(|i| (i.symbol.as_str(), i)).collect();
+                for i in ins.iter() {
+                    fees.insert((v.name().to_string(), i.base.clone()), (crate::model::f(i.fees.maker), crate::model::f(i.fees.taker)));
+                }
+                for x in fs {
+                    if let Some(i) = by_sym.get(x.symbol.as_str()) {
+                        rows.push((v.name().to_string(), i.base.clone(), x.rate_h, x.interval_h, x.next_ms.unwrap_or(0)));
+                    }
+                }
+            }
+            crate::corridor::on_funding(t, rows, fees);
+        }
         if let Ok(mut f_) = std::fs::OpenOptions::new().create(true).append(true).open(dir.join(format!("funding_{day}.csv"))) {
             let mut n = 0;
             for (v, fs, ins) in got {
@@ -648,6 +668,7 @@ async fn write(mut rx: tokio::sync::mpsc::UnboundedReceiver<Ev>, dir: &std::path
                 let o = out.as_mut().unwrap();
                 match e {
                     Ev::Bbo { venue, asset, bid, bsz, ask, asz, ts_ex } => {
+                        crate::corridor::on_bbo(venue, &asset, bid, bsz, ask, asz, t);
                         let k = (venue, asset.clone());
                         if let Some(p) = last.get(&k) {
                             if p.0 == bid && p.2 == ask && !moved(p.1, bsz) && !moved(p.3, asz) { continue; }
@@ -658,6 +679,7 @@ async fn write(mut rx: tokio::sync::mpsc::UnboundedReceiver<Ev>, dir: &std::path
                         seen.insert(venue, t);
                     }
                     Ev::Trade { venue, asset, px, sz, side, ts_ex } => {
+                        crate::corridor::on_trade(venue, &asset, px, sz, t);
                         writeln!(o, "T,{t},{},{venue},{asset},{px},{sz},{side}", ts_ex.unwrap_or(0))?;
                         *nt.entry(venue).or_default() += 1;
                         seen.insert(venue, t);
@@ -667,6 +689,7 @@ async fn write(mut rx: tokio::sync::mpsc::UnboundedReceiver<Ev>, dir: &std::path
             }
             _ = flush.tick() => {
                 if let Some(o) = out.as_mut() { let _ = o.flush(); }
+                crate::corridor::tick(now_ms());
                 if now_ms() >= until_ms { break; }
             }
             _ = report.tick() => {
