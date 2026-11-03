@@ -18,6 +18,7 @@ use std::fmt::Write;
 #[derive(Clone)]
 struct Ser {
     venue: String,
+    symbol: String,
     stock: bool,
     /// (settlement ms, rate_h, the interval h)
     pts: Vec<(i64, f64, f64)>,
@@ -25,6 +26,17 @@ struct Ser {
     maker: f64,
     /// The market's median bid-ask spread (fraction), from the WebSocket books (data/spreads.json; else its venue's median).
     spread: f64,
+    /// The market's median mid per unit of the underlying on the WebSocket books (data/prices.json), when measured.
+    price: Option<f64>,
+}
+
+/// The same token on both venues: their mids within 10% (a ticker shared by two tokens is 10x+ apart: PRL, QNT, XIAOMI,
+/// BB, MEME, PURR, CVX on 2026-11-03; a market not priced passes).
+fn same(a: &Ser, b: &Ser) -> bool {
+    match (a.price, b.price) {
+        (Some(x), Some(y)) => (x / y - 1.0).abs() < 0.10,
+        _ => true,
+    }
 }
 
 fn maker_of(v: &str) -> f64 {
@@ -60,6 +72,7 @@ pub fn run() -> Result<()> {
     let dir = crate::data_dir().join("funding");
     let meta: Vec<serde_json::Value> = serde_json::from_str(&std::fs::read_to_string(dir.join("meta.json"))?)?;
     // the markets' spreads (bp) measured on the books; a market not measured: its venue's median
+    let prices: HashMap<String, f64> = std::fs::read_to_string(crate::data_dir().join("prices.json")).ok().and_then(|x| serde_json::from_str(&x).ok()).unwrap_or_default();
     let spreads: HashMap<String, f64> = std::fs::read_to_string(crate::data_dir().join("spreads.json")).ok().and_then(|x| serde_json::from_str(&x).ok()).unwrap_or_default();
     let mut venue_sp: HashMap<String, f64> = HashMap::new();
     {
@@ -89,7 +102,7 @@ pub fn run() -> Result<()> {
         let n = if (iv_data - iv).abs() > 0.5 { iv_data } else { iv };
         let stock = m["symbol"].as_str().is_some_and(|s| s.contains(':')) || m["category"].as_str().is_some_and(|c| c.eq_ignore_ascii_case("equity") || c.eq_ignore_ascii_case("stock"));
         let sp = spreads.get(&format!("{v}|{base}")).copied().or_else(|| venue_sp.get(v).copied()).unwrap_or(10.0) / 1e4;
-        by.entry(base.to_string()).or_default().push(Ser { venue: v.into(), stock, pts: raw.iter().map(|p| (p.ts_ms, p.rate_h, n)).collect(), taker: m["taker"].as_f64().unwrap_or(0.0005), maker: maker_of(v), spread: sp });
+        by.entry(base.to_string()).or_default().push(Ser { venue: v.into(), symbol: m["symbol"].as_str().unwrap_or("").into(), stock, pts: raw.iter().map(|p| (p.ts_ms, p.rate_h, n)).collect(), taker: m["taker"].as_f64().unwrap_or(0.0005), maker: maker_of(v), spread: sp, price: prices.get(&format!("{v}|{base}")).copied() });
     }
     // an underlying is "stock-like" when any venue lists it as a HIP-3 / equity market
     let kinds: HashMap<String, bool> = by.iter().map(|(a, v)| (a.clone(), v.iter().any(|s| s.stock))).collect();
@@ -114,7 +127,7 @@ pub fn run() -> Result<()> {
     for (ai, (_, ser)) in assets.iter().enumerate() {
         for (li, la) in ser.iter().enumerate() {
             for (si, sb) in ser.iter().enumerate() {
-                if li == si {
+                if li == si || !same(la, sb) {
                     continue;
                 }
                 for &h in hours.iter().step_by(1) {
@@ -148,6 +161,7 @@ pub fn run() -> Result<()> {
     let apr = |x: f64| x * 8760.0 * 100.0;
     let mut rep = String::new();
     writeln!(rep, "# Funding stability ({} underlyings on 2+ venues, {:.0} days, {} pair-hours with a known spread > 10% APR)\n", assets.len(), (t1 - t0) as f64 / 8.64e7, obs.len())?;
+    writeln!(rep, "The pairs of two tokens under one ticker (the mids 10%+ apart on the books, data/prices.json) left out.\n")?;
     writeln!(rep, "The known spread at hour H = the short venue's last settled rate - the long venue's (what one sees then); the paid = the settlements after H (each at its interval), per hour of the hold. Retention = paid / known.\n")?;
 
     // 1. retention by the level
@@ -228,12 +242,13 @@ pub fn run() -> Result<()> {
 ")?;
     writeln!(rep, "| theta (APR) | held m h | half 1: trades / mean bp (taker) / (maker-taker) | half 2: trades / mean bp (taker) / (maker-taker) / win (m-t) / mean hold h |")?;
     writeln!(rep, "|---|---|---|---|")?;
+    let dump: std::cell::RefCell<Option<Vec<serde_json::Value>>> = std::cell::RefCell::new(None);
     let trade_x = |theta: f64, m: usize, half: bool, maker: bool, exit_frac: f64, min_hold_h: i64| -> (usize, f64, usize, f64) {
         let (mut n, mut tot, mut wins, mut hold) = (0usize, 0.0, 0usize, 0.0);
         for (ai, (_, ser)) in assets.iter().enumerate() {
             for (li, la) in ser.iter().enumerate() {
                 for (si, sb) in ser.iter().enumerate() {
-                    if li == si {
+                    if li == si || !same(la, sb) {
                         continue;
                     }
                     // the round trip: maker-taker = the limit leg's maker fee + the hedge's taker fee and half its spread, both
@@ -274,6 +289,11 @@ pub fn run() -> Result<()> {
                         }
                         let j = j.min(hours.len() - 1);
                         let r = paid(sb, h, hours[j]) - paid(la, h, hours[j]) - rt;
+                        if let Some(d) = dump.borrow_mut().as_mut() {
+                            d.push(serde_json::json!({"asset": assets[ai].0, "long": la.venue, "long_symbol": la.symbol, "short": sb.venue, "short_symbol": sb.symbol,
+                                "entry_ms": h, "exit_ms": hours[j], "funding": paid(sb, h, hours[j]) - paid(la, h, hours[j]), "rt": rt, "half": if half { 1 } else { 2 },
+                                "stock": la.stock || sb.stock}));
+                        }
                         n += 1;
                         tot += r;
                         wins += (r > 0.0) as usize;
@@ -324,7 +344,10 @@ pub fn run() -> Result<()> {
             }
         }
     }
+    *dump.borrow_mut() = Some(Vec::new());
+    trade_x(best_b.1, best_b.2, true, true, best_b.3, best_b.4);
     let (n2, s2, w2, h2) = trade_x(best_b.1, best_b.2, false, true, best_b.3, best_b.4);
+    std::fs::write(crate::data_dir().join("fstab_trades.json"), serde_json::to_string_pretty(&dump.borrow_mut().take())?)?;
     writeln!(rep, "
 **Chosen on half 1:** theta {:.0}%, held {} h, exit f {}, min hold {} h (half 1 {:+.1} bp). **Half 2:** {} trades, {:+.1} bp, win {:.0}%, mean hold {:.0} h.
 ",

@@ -11,6 +11,7 @@
 //!   dexarb fundrank [--top N]                     the shared assets by the cross-venue funding spread now
 //!   dexarb mt [--lq MS] [--lh MS] [--hold-min M]   the maker-taker simulator on the WebSocket data (a limit on A, the hedge at market on B)
 //!   dexarb fstab                       the funding-stability study on data/funding -> data/fstab.md
+//!   dexarb lev                         the leverage study: fstab's trades on each leg's 15-min bars, the liquidations and the guards -> data/lev.md
 //!   dexarb collect [--every S]         the forward collector + the paper engine (deliverables 5 level D, 6)
 
 mod averaging;
@@ -19,6 +20,7 @@ mod collect;
 mod exec;
 mod fstab;
 mod history;
+mod lev;
 mod http;
 mod model;
 mod mt;
@@ -75,6 +77,7 @@ async fn main() -> Result<()> {
         }
         "research" => research::run(),
         "fstab" => fstab::run(),
+        "lev" => lev::run(&h).await,
         "mt" => mt::run(&h, &args[2..]).await,
         "ws" => {
             // --assets A,B,..: a fixed list; else the --top N (25) by the cross-venue funding spread, re-ranked each hour
